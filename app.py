@@ -3,8 +3,6 @@ Pixel Transport Morph — Streamlit App
 Luminance-sorted approximate optimal transport between two images.
 Source pixel colors are preserved — only positions animate.
 Canvas adapts to target image aspect ratio.
-Particle size auto-scales to fill canvas without gaps.
-Background pixels are filtered out via corner-color detection.
 """
 
 import streamlit as st
@@ -16,59 +14,27 @@ st.set_page_config(page_title="Pixel Transport", layout="centered")
 
 # ─── Python: image processing & transport mapping ───────────────────────────
 
-def detect_bg_color(arr: np.ndarray, threshold: int = 40) -> np.ndarray | None:
+def sample_pixels(img: Image.Image, count: int) -> np.ndarray:
     """
-    Detect background color by sampling corner regions.
-    Returns the dominant corner color if corners are consistent, else None.
-    """
-    h, w = arr.shape[:2]
-    margin_y, margin_x = max(1, h // 20), max(1, w // 20)
-
-    corners = np.concatenate([
-        arr[:margin_y, :margin_x, :3].reshape(-1, 3),       # top-left
-        arr[:margin_y, -margin_x:, :3].reshape(-1, 3),      # top-right
-        arr[-margin_y:, :margin_x, :3].reshape(-1, 3),      # bottom-left
-        arr[-margin_y:, -margin_x:, :3].reshape(-1, 3),     # bottom-right
-    ])
-
-    median_color = np.median(corners, axis=0)
-    # Check if corners are consistent (low variance = solid background)
-    dists = np.linalg.norm(corners.astype(float) - median_color, axis=1)
-    if np.percentile(dists, 75) < threshold:
-        return median_color
-    return None
-
-
-def sample_pixels(img: Image.Image, count: int, filter_bg: bool = True) -> np.ndarray:
-    """
-    Sample up to `count` non-transparent, non-background pixels.
+    Sample up to `count` non-transparent pixels from a PIL Image.
     Returns array of shape (N, 6): [x_norm, y_norm, r, g, b, luminance]
+    Coordinates normalized to [0, 1] relative to the image's own dimensions.
     """
     img = img.convert("RGBA")
     arr = np.array(img)
     h, w = arr.shape[:2]
 
-    # Adaptive stride
+    # Adaptive step: for very large images, increase stride
     step = max(2, int(np.sqrt(h * w / (count * 4))))
     ys, xs = np.mgrid[0:h:step, 0:w:step]
     ys, xs = ys.ravel(), xs.ravel()
     pixels = arr[ys, xs]
 
-    # Filter transparent
+    # Filter out near-transparent pixels
     mask = pixels[:, 3] > 20
     xs, ys, pixels = xs[mask], ys[mask], pixels[mask]
 
-    # Filter background color
-    if filter_bg and len(xs) > 0:
-        bg = detect_bg_color(arr)
-        if bg is not None:
-            dists = np.linalg.norm(pixels[:, :3].astype(float) - bg, axis=1)
-            fg_mask = dists > 35
-            # Only apply if it keeps at least 20% of pixels (avoid wiping everything)
-            if fg_mask.sum() > len(xs) * 0.2:
-                xs, ys, pixels = xs[fg_mask], ys[fg_mask], pixels[fg_mask]
-
-    # Reservoir sample
+    # Reservoir sample if too many
     n = len(xs)
     if n > count:
         idx = np.random.choice(n, count, replace=False)
@@ -80,23 +46,27 @@ def sample_pixels(img: Image.Image, count: int, filter_bg: bool = True) -> np.nd
     return np.column_stack([xs / w, ys / h, r, g, b, lum])
 
 
-def build_particle_data(source_img: Image.Image, target_img: Image.Image,
-                        count: int) -> tuple[str, int]:
+def build_particle_data(source_img: Image.Image, target_img: Image.Image, count: int) -> str:
     """
     Sample both images, sort by luminance, pair 1:1.
-    Returns (json_string, actual_particle_count).
+    Only source colors are kept — target supplies positions only.
     """
-    src = sample_pixels(source_img, count, filter_bg=True)
-    tgt = sample_pixels(target_img, count, filter_bg=True)
+    src = sample_pixels(source_img, count)
+    tgt = sample_pixels(target_img, count)
 
+    # Sort both by luminance (column 5) for approximate optimal transport
     src = src[src[:, 5].argsort()]
     tgt = tgt[tgt[:, 5].argsort()]
 
+    # Match counts
     n = min(len(src), len(tgt))
     src, tgt = src[:n], tgt[:n]
 
+    # Random stagger delay per particle
     delays = np.random.uniform(0, 0.15, n)
 
+    # Pack as flat arrays for compact JSON
+    # Each particle: sx, sy, r, g, b, tx, ty, delay
     flat = np.column_stack([
         src[:, 0], src[:, 1],
         src[:, 2], src[:, 3], src[:, 4],
@@ -109,20 +79,13 @@ def build_particle_data(source_img: Image.Image, target_img: Image.Image,
     flat[:, 7] = np.round(flat[:, 7], 4)
     flat[:, 2:5] = np.round(flat[:, 2:5], 0)
 
-    return json.dumps(flat.tolist()), n
+    return json.dumps(flat.tolist())
 
 
 # ─── JS: canvas animation component ────────────────────────────────────────
 
 def render_animation_html(particle_json: str, duration_ms: int,
-                          canvas_w: int, canvas_h: int,
-                          particle_count: int) -> str:
-    # Compute dot size so particles tile the canvas without black gaps
-    # Area per particle → side length, with slight overlap factor
-    area_per_dot = (canvas_w * canvas_h) / max(particle_count, 1)
-    dot_size = max(1.5, min(6, np.sqrt(area_per_dot) * 1.15))
-    dot_size = round(dot_size, 2)
-
+                          canvas_w: int, canvas_h: int) -> str:
     return f"""
 <!DOCTYPE html>
 <html>
@@ -199,8 +162,6 @@ def render_animation_html(particle_json: str, duration_ms: int,
 const raw = {particle_json};
 const N = raw.length;
 const DURATION = {duration_ms};
-const DOT = {dot_size};
-const HALF = DOT / 2;
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 const bar = document.getElementById('bar');
@@ -227,7 +188,7 @@ function draw(t) {{
     const x = (p[0] + (p[5] - p[0]) * e) * W;
     const y = (p[1] + (p[6] - p[1]) * e) * H;
     ctx.fillStyle = 'rgb(' + p[2] + ',' + p[3] + ',' + p[4] + ')';
-    ctx.fillRect(x - HALF, y - HALF, DOT, DOT);
+    ctx.fillRect(x - 1, y - 1, 2.5, 2.5);
   }}
   bar.style.width = (t * 100) + '%';
   currentT = t;
@@ -301,7 +262,7 @@ st.markdown(
 st.title("Pixel Transport Morph")
 st.caption(
     "Pixels from the source image travel to the target image's positions — "
-    "keeping their original colors. The target's structure emerges from the source's palette."
+    "but keep their original colors. The target's structure emerges from the source's palette."
 )
 
 col1, col2 = st.columns(2)
@@ -322,11 +283,9 @@ with col2:
 
 with st.sidebar:
     st.header("Parameters")
-    particle_count = st.slider("Particle count", 5000, 40000, 18000, step=1000)
+    particle_count = st.slider("Particle count", 5000, 30000, 15000, step=1000)
     duration_ms = st.slider("Animation duration (ms)", 1000, 8000, 3000, step=500)
     max_dim = st.slider("Max canvas dimension (px)", 300, 800, 550, step=50)
-    filter_bg = st.checkbox("Filter background pixels", value=True,
-                            help="Remove solid-color backgrounds (white, black, etc.) from both images")
 
 
 # ─── Default images ─────────────────────────────────────────────────────────
@@ -372,17 +331,12 @@ else:
     canvas_h = max_dim
     canvas_w = int(max_dim * aspect)
 
-
 # ─── Build particles and render ─────────────────────────────────────────────
 
 with st.spinner("Computing transport mapping..."):
-    particle_json, actual_count = build_particle_data(
-        source_img, target_img, particle_count
-    )
-
-st.caption(f"Particles: {actual_count:,} | Canvas: {canvas_w}×{canvas_h}px")
+    particle_json = build_particle_data(source_img, target_img, particle_count)
 
 st.components.v1.html(
-    render_animation_html(particle_json, duration_ms, canvas_w, canvas_h, actual_count),
+    render_animation_html(particle_json, duration_ms, canvas_w, canvas_h),
     height=canvas_h + 80,
 )
